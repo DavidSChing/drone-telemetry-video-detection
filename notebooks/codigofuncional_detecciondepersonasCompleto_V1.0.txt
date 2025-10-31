@@ -1,0 +1,426 @@
+# camera_stream.py
+import os
+# Configurar la variable de entorno para permitir múltiples implementaciones de OpenMP
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# No forzar un dispositivo específico, usar el primero disponible
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# Configurar para usar la GPU si está disponible
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+import cv2
+import numpy as np
+import requests
+from requests.exceptions import RequestException
+import torch
+from ultralytics import YOLO
+import time
+from datetime import datetime
+
+# Configuración de detección
+CONFIDENCE_THRESHOLD = 0.35  # Umbral de confianza para detecciones
+MAX_FRAMES_HISTORY = 5  # Número de frames para promediar
+PROCESS_EVERY_N_FRAMES = 3  # Procesar solo 1 de cada N frames
+TARGET_SIZE = (256, 192)  # Tamaño reducido para procesamiento más rápido
+
+# Verificar disponibilidad de CUDA
+print("PyTorch versión:", torch.__version__)
+print("CUDA disponible:", torch.cuda.is_available())
+print("Número de GPUs:", torch.cuda.device_count())
+
+if torch.cuda.is_available():
+    print(f"Usando GPU: {torch.cuda.get_device_name(0)}")
+    print("CUDA versión:", torch.version.cuda)
+    device = "cuda"
+else:
+    print("GPU no disponible, usando CPU")
+    print("Razones posibles:")
+    print("1. No hay GPU NVIDIA instalada")
+    print("2. Drivers NVIDIA no instalados o desactualizados")
+    print("3. CUDA Toolkit no instalado o incompatible")
+    device = "cpu"
+
+# URL de la ESP32-CAM y configuración del stream
+ESP32_URL = "http://172.20.10.2/stream"
+BOUNDARY = b'--1234567890000000000009876543'
+
+# Cargar y configurar modelo YOLO
+model = YOLO('yolov8n.pt')
+model.to(device)
+if torch.cuda.is_available():
+    model.fuse()  # Fusionar capas para mejor rendimiento en GPU
+
+# Cargar modelo YOLOv5
+model = YOLO('yolov8n.pt')  # Modelo pequeño y rápido
+model.to(device)  # Mover modelo a GPU
+
+class DetectionTracker:
+    def __init__(self, max_history=MAX_FRAMES_HISTORY):
+        self.max_history = max_history
+        self.detection_history = []
+        self.last_count = 0
+        self.frame_latency_history = []
+        self.rtt_history = []
+        self.last_frame_time = time.time()
+        self.last_request_time = time.time()
+        self.total_detections = 0
+        self.start_time = time.time()
+        self.frame_count = 0
+        self.last_fps_update = time.time()
+        self.current_fps = 0
+        
+    def update(self, current_detections, is_new_frame=True):
+        current_time = time.time()
+        
+        if is_new_frame:
+            # Actualizar conteo de frames y calcular FPS cada segundo
+            self.frame_count += 1
+            time_elapsed = current_time - self.last_fps_update
+            
+            # Actualizar FPS cada segundo
+            if time_elapsed >= 1.0:
+                self.current_fps = self.frame_count / time_elapsed
+                self.frame_count = 0
+                self.last_fps_update = current_time
+            
+            # Calcular y actualizar latencia
+            frame_latency = current_time - self.last_frame_time
+            if frame_latency > 0:
+                self.frame_latency_history.append(frame_latency * 1000)  # Convertir a ms
+                if len(self.frame_latency_history) > 30:
+                    self.frame_latency_history.pop(0)
+            self.last_frame_time = current_time
+        
+        # RTT (Round Trip Time)
+        rtt = current_time - self.last_request_time
+        self.last_request_time = current_time
+        if rtt > 0:
+            self.rtt_history.append(rtt * 1000)  # Convertir a ms
+            if len(self.rtt_history) > 30:
+                self.rtt_history.pop(0)
+            
+        # Añadir nuevas detecciones al historial
+        self.detection_history.append(current_detections)
+        self.total_detections += len(current_detections)
+        
+        # Mantener solo los últimos N frames
+        if len(self.detection_history) > self.max_history:
+            self.detection_history.pop(0)
+        
+        # Calcular el promedio de personas detectadas
+        if self.detection_history:
+            counts = [len(d) for d in self.detection_history]
+            avg_count = round(sum(counts) / len(counts))
+            
+            # Actualizar solo si el cambio es significativo
+            if abs(avg_count - self.last_count) >= 1:
+                self.last_count = avg_count
+                
+        # Calcular promedios de manera segura
+        avg_fps = round(self.current_fps, 1)  # FPS calculado sobre 1 segundo completo
+        avg_frame_latency = round(sum(self.frame_latency_history) / len(self.frame_latency_history), 1) if self.frame_latency_history else 0
+        avg_rtt = round(sum(self.rtt_history) / len(self.rtt_history), 1) if self.rtt_history else 0
+        
+        stats = {
+            'fps': avg_fps,
+            'frame_latency': avg_frame_latency,
+            'rtt': avg_rtt,
+            'tiempo_total': round(current_time - self.start_time, 1),
+            'detecciones_totales': self.total_detections,
+            'personas_actuales': self.last_count
+        }
+                
+        return self.last_count, stats
+
+# Crear instancia del tracker
+tracker = DetectionTracker()
+
+def mostrar_pantalla_inicio():
+    # Crear una ventana de inicio con espacio para panel lateral
+    window_name = 'ESP32-CAM Stream'
+    window_width = 1024  # Ancho total de la ventana
+    window_height = 600  # Alto total de la ventana
+    img = np.zeros((window_height, window_width, 3), dtype=np.uint8)
+    
+    # Configuración de texto
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    color_texto = (0, 255, 0)
+    
+    # Título
+    cv2.putText(img, "Sistema de Detección de Personas", 
+                (100, 180), font, 1.2, color_texto, 2)
+    cv2.putText(img, "PUCP - Proyecto de Diseño Mecatrónico", 
+                (120, 230), font, 0.8, color_texto, 2)
+    
+    # Estado
+    cv2.putText(img, "Iniciando sistema...", 
+                (220, 300), font, 0.7, (0, 255, 255), 1)
+    
+    # Información del sistema
+    info_y = 350
+    cv2.putText(img, f"PyTorch: {torch.__version__}", 
+                (50, info_y), font, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, f"CUDA: {torch.version.cuda if torch.cuda.is_available() else 'No disponible'}", 
+                (50, info_y + 30), font, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}", 
+                (50, info_y + 60), font, 0.6, (200, 200, 200), 1)
+    
+    cv2.imshow(window_name, img)
+    cv2.waitKey(2000)  # Mostrar por 2 segundos
+    return window_name
+
+def stream_camera():
+    try:
+        # Mostrar pantalla de inicio
+        window_name = mostrar_pantalla_inicio()
+        print(f"Conectando a {ESP32_URL}...")
+        
+        # Configurar headers
+        headers = {
+            'Accept': 'multipart/x-mixed-replace;boundary=1234567890000000000009876543'
+        }
+        
+        # Iniciar el stream
+        response = requests.get(ESP32_URL, stream=True, headers=headers)
+        
+        if response.status_code != 200:
+            raise RequestException(f"Error de conexión: código {response.status_code}")
+            
+        print("[OK] Conexión establecida")
+        
+        # Buffer para los datos
+        buffer = b''
+        
+        # Crear ventana para mostrar el video
+        cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+        
+        # Usar un chunk_size más pequeño para reducir latencia
+        for chunk in response.iter_content(chunk_size=1024):
+            if not chunk:
+                continue
+            
+            # Limitar el tamaño del buffer antes de agregar nuevo chunk
+            if len(buffer) > 32768:  # 32KB máximo
+                buffer = buffer[-16384:]  # Mantener solo los últimos 16KB
+                
+            buffer += chunk
+            
+            # Buscar el boundary que separa las imágenes
+            boundary_pos = buffer.find(BOUNDARY)
+            
+            while boundary_pos != -1:
+                # Encontrar el inicio del JPEG
+                jpeg_start = buffer.find(b'\xff\xd8', boundary_pos)
+                if jpeg_start == -1:
+                    break
+                    
+                # Encontrar el final del JPEG
+                jpeg_end = buffer.find(b'\xff\xd9', jpeg_start)
+                if jpeg_end == -1:
+                    break
+                
+                # Extraer y decodificar el frame JPEG
+                jpg_data = buffer[jpeg_start:jpeg_end + 2]
+                buffer = buffer[jpeg_end + 2:]
+                
+                    # Convertir a imagen
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    # Crear un canvas más grande para el frame y el panel lateral
+                    canvas = np.zeros((600, 1024, 3), dtype=np.uint8)
+                    
+                    # Procesar el frame para detecciones
+                    frame_for_detection = frame.copy()
+                    
+                    # Mostrar frame original en la parte izquierda
+                    frame_height, frame_width = frame.shape[:2]
+                    canvas[50:50+frame_height, 50:50+frame_width] = frame
+                    
+                    # Contador de frames para procesar solo algunos
+                    if hasattr(stream_camera, 'frame_count'):
+                        stream_camera.frame_count += 1
+                    else:
+                        stream_camera.frame_count = 0                    # Panel lateral para métricas
+                    panel_x = 50 + frame_width + 30  # 30px de separación
+                    panel_width = canvas.shape[1] - panel_x - 50  # 50px de margen derecho
+                    
+                    # Procesar solo 1 de cada N frames
+                    if stream_camera.frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                        # Redimensionar directamente al tamaño objetivo para procesamiento
+                        frame_resized = cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+                    else:
+                        # Usar últimas detecciones conocidas
+                        frame_resized = None
+
+                    if frame_resized is not None:
+                        # Detectar personas con YOLO
+                        results = model(frame_resized)
+                        
+                        # Filtrar solo detecciones de personas con alta confianza
+                        detections = results[0].boxes.data
+                        personas_detectadas = []
+                        
+                        # Calcular factor de escala para redimensionar las detecciones al tamaño original
+                        scale_x = frame.shape[1] / TARGET_SIZE[0]
+                        scale_y = frame.shape[0] / TARGET_SIZE[1]
+                        
+                        for det in detections:
+                            if int(det[5]) == 0 and float(det[4]) >= CONFIDENCE_THRESHOLD:  # Clase 0 es 'person' en COCO
+                                x1, y1, x2, y2, conf = det[:5]
+                                # Convertir coordenadas al formato (x, y, w, h) y escalar al tamaño original
+                                x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
+                                x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
+                                w, h = x2 - x1, y2 - y1
+                                # Solo considerar detecciones con tamaño razonable
+                                area = w * h
+                                if area >= 800 and area <= 200000:  # Rango más amplio pero con límite superior
+                                    personas_detectadas.append(((x1, y1, w, h), conf))
+                    
+                    # Dibujar las detecciones con estilo moderno
+                    for (x, y, w, h), conf in personas_detectadas:
+                        # Ajustar coordenadas para el offset del canvas
+                        x_canvas = x + 50  # 50 es el margen izquierdo
+                        y_canvas = y + 50  # 50 es el margen superior
+                        
+                        # Color base para las detecciones
+                        color_box = (0, 255, 0)
+                        
+                        # Dibujar rectángulo principal
+                        cv2.rectangle(canvas, (x_canvas, y_canvas), 
+                                   (x_canvas + w, y_canvas + h), color_box, 2)
+                        
+                        # Barra superior con etiqueta y confianza
+                        label_bg_color = (40, 40, 40)
+                        label_height = 25
+                        confianza = f"Persona {conf*100:.0f}%"
+                        
+                        # Fondo de la etiqueta
+                        cv2.rectangle(canvas, (x_canvas, y_canvas - label_height), 
+                                   (x_canvas + w, y_canvas), label_bg_color, -1)
+                        
+                        # Texto de la etiqueta
+                        cv2.putText(canvas, confianza, (x_canvas + 5, y_canvas - 7),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        
+                        # Indicador de esquina superior izquierda
+                        corner_size = 20
+                        cv2.line(canvas, (x_canvas, y_canvas), 
+                               (x_canvas + corner_size, y_canvas), color_box, 2)
+                        cv2.line(canvas, (x_canvas, y_canvas), 
+                               (x_canvas, y_canvas + corner_size), color_box, 2)
+                        
+                        # Indicador de esquina inferior derecha
+                        cv2.line(canvas, (x_canvas + w - corner_size, y_canvas + h), 
+                               (x_canvas + w, y_canvas + h), color_box, 2)
+                        cv2.line(canvas, (x_canvas + w, y_canvas + h - corner_size), 
+                               (x_canvas + w, y_canvas + h), color_box, 2)
+                    
+                    # Obtener estadísticas
+                    num_personas, stats = tracker.update(personas_detectadas)
+                    
+                    # Configuración de la interfaz
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    color_titulo = (0, 220, 0)  # Verde claro
+                    color_texto = (200, 200, 200)  # Gris claro
+                    
+                    # Título en la parte superior
+                    cv2.putText(canvas, "Sistema de Detección de Personas - PUCP", 
+                              (50, 30), font, 0.8, color_titulo, 2)
+                    
+                    # Panel de métricas de rendimiento
+                    y_pos = 80
+                    
+                    # Dibujar fondo para métricas
+                    metrics_bg = np.zeros((160, panel_width, 3), dtype=np.uint8)
+                    metrics_bg[:, :] = (30, 30, 30)  # Fondo gris oscuro
+                    canvas[y_pos:y_pos+160, panel_x:panel_x+panel_width] = metrics_bg
+                    
+                    # Contador de personas
+                    cv2.putText(canvas, "Personas detectadas:", 
+                              (panel_x + 10, y_pos + 30), font, 0.7, color_texto, 1)
+                    cv2.putText(canvas, str(num_personas), 
+                              (panel_x + panel_width - 60, y_pos + 30), font, 0.9, color_titulo, 2)
+                    
+                    # Métricas de rendimiento
+                    y_pos += 50
+                    # FPS
+                    fps = stats['fps']
+                    fps_text = f"{fps:.1f} FPS"
+                    if fps >= 30:
+                        fps_color = (0, 255, 0)  # Verde
+                    elif fps >= 20:
+                        fps_color = (0, 255, 255)  # Amarillo
+                    else:
+                        fps_color = (0, 0, 255)  # Rojo
+                    cv2.putText(canvas, fps_text, 
+                              (panel_x + 10, y_pos), font, 0.6, fps_color, 2)
+                    
+                    # Latencia de frames
+                    frame_latency = stats['frame_latency']
+                    latency_text = f"Latencia: {frame_latency:.1f} ms"
+                    if frame_latency <= 30:
+                        latency_color = (0, 255, 0)
+                    elif frame_latency <= 50:
+                        latency_color = (0, 255, 255)
+                    else:
+                        latency_color = (0, 0, 255)
+                    cv2.putText(canvas, latency_text, 
+                              (panel_x + 10, y_pos + 30), font, 0.6, latency_color, 2)
+                    
+                    # RTT
+                    rtt = stats['rtt']
+                    rtt_text = f"RTT: {rtt:.1f} ms"
+                    if rtt <= 50:
+                        rtt_color = (0, 255, 0)
+                    elif rtt <= 100:
+                        rtt_color = (0, 255, 255)
+                    else:
+                        rtt_color = (0, 0, 255)
+                    cv2.putText(canvas, rtt_text, 
+                              (panel_x + 10, y_pos + 60), font, 0.6, rtt_color, 2)
+                    
+                    # Otras estadísticas
+                    y_pos += 100
+                    cv2.putText(canvas, f"Tiempo de ejecución: {stats['tiempo_total']}s", 
+                              (panel_x, y_pos), font, 0.6, color_texto, 1)
+                    
+                    y_pos += 30
+                    cv2.putText(canvas, f"Total detecciones: {stats['detecciones_totales']}", 
+                              (panel_x, y_pos), font, 0.6, color_texto, 1)
+                    
+                    # Fecha y hora actual
+                    y_pos += 40
+                    tiempo_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cv2.putText(canvas, tiempo_actual, 
+                              (panel_x, y_pos), font, 0.6, color_texto, 1)
+                              
+                    # Borde del video
+                    cv2.rectangle(canvas, (48, 48), (52+frame_width, 52+frame_height), color_titulo, 2)
+                    
+                    # Mostrar el canvas completo
+                    cv2.imshow('ESP32-CAM Stream', canvas)
+                    
+                    # Salir con ESC o si la ventana se cierra
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27 or cv2.getWindowProperty('ESP32-CAM Stream', cv2.WND_PROP_VISIBLE) < 1:
+                        return
+                        
+                # Buscar el siguiente boundary
+                boundary_pos = buffer.find(BOUNDARY)
+            
+            # Limpiar el buffer después de procesar cada frame
+            if boundary_pos != -1 and len(buffer) > 16384:  # 16KB
+                buffer = b''  # Reiniciar el buffer
+                
+    except RequestException as e:
+        print(f"Error de conexión: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        cv2.destroyAllWindows()
+    
+
+
+if __name__ == "__main__":
+    stream_camera()

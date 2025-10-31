@@ -1,0 +1,237 @@
+# camera_stream.py
+import os
+# Configurar la variable de entorno para permitir múltiples implementaciones de OpenMP
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# No forzar un dispositivo específico, usar el primero disponible
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# Configurar para usar la GPU si está disponible
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+import cv2
+import numpy as np
+import requests
+from requests.exceptions import RequestException
+import torch
+from ultralytics import YOLO
+
+# Configuración de detección
+CONFIDENCE_THRESHOLD = 0.45  # Umbral de confianza para detecciones
+MAX_FRAMES_HISTORY = 5  # Número de frames para promediar
+PROCESS_EVERY_N_FRAMES = 3  # Procesar solo 1 de cada N frames
+TARGET_SIZE = (256, 192)  # Tamaño reducido para procesamiento más rápido
+
+# Verificar disponibilidad de CUDA
+print("PyTorch versión:", torch.__version__)
+print("CUDA disponible:", torch.cuda.is_available())
+print("Número de GPUs:", torch.cuda.device_count())
+
+if torch.cuda.is_available():
+    print(f"Usando GPU: {torch.cuda.get_device_name(0)}")
+    print("CUDA versión:", torch.version.cuda)
+    device = "cuda"
+else:
+    print("GPU no disponible, usando CPU")
+    print("Razones posibles:")
+    print("1. No hay GPU NVIDIA instalada")
+    print("2. Drivers NVIDIA no instalados o desactualizados")
+    print("3. CUDA Toolkit no instalado o incompatible")
+    device = "cpu"
+
+# URL de la ESP32-CAM y configuración del stream
+ESP32_URL = "http://172.20.10.2/stream"
+BOUNDARY = b'--1234567890000000000009876543'
+
+# Cargar y configurar modelo YOLO
+model = YOLO('yolov8n.pt')
+model.to(device)
+if torch.cuda.is_available():
+    model.fuse()  # Fusionar capas para mejor rendimiento en GPU
+
+# Cargar modelo YOLOv5
+model = YOLO('yolov8n.pt')  # Modelo pequeño y rápido
+model.to(device)  # Mover modelo a GPU
+
+class DetectionTracker:
+    def __init__(self, max_history=MAX_FRAMES_HISTORY):
+        self.max_history = max_history
+        self.detection_history = []
+        self.last_count = 0
+        
+    def update(self, current_detections):
+        # Añadir nuevas detecciones al historial
+        self.detection_history.append(current_detections)
+        
+        # Mantener solo los últimos N frames
+        if len(self.detection_history) > self.max_history:
+            self.detection_history.pop(0)
+        
+        # Calcular el promedio de personas detectadas
+        if self.detection_history:
+            counts = [len(d) for d in self.detection_history]
+            avg_count = round(sum(counts) / len(counts))
+            
+            # Actualizar solo si el cambio es significativo
+            if abs(avg_count - self.last_count) >= 1:
+                self.last_count = avg_count
+                
+        return self.last_count
+
+# Crear instancia del tracker
+tracker = DetectionTracker()
+
+def stream_camera():
+    try:
+        print(f"Conectando a {ESP32_URL}...")
+        
+        # Configurar headers
+        headers = {
+            'Accept': 'multipart/x-mixed-replace;boundary=1234567890000000000009876543'
+        }
+        
+        # Iniciar el stream
+        response = requests.get(ESP32_URL, stream=True, headers=headers)
+        
+        if response.status_code != 200:
+            raise RequestException(f"Error de conexión: código {response.status_code}")
+            
+        print("[OK] Conexión establecida")
+        
+        # Buffer para los datos
+        buffer = b''
+        
+        # Crear ventana para mostrar el video
+        cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+        
+        # Usar un chunk_size más pequeño para reducir latencia
+        for chunk in response.iter_content(chunk_size=1024):
+            if not chunk:
+                continue
+            
+            # Limitar el tamaño del buffer antes de agregar nuevo chunk
+            if len(buffer) > 32768:  # 32KB máximo
+                buffer = buffer[-16384:]  # Mantener solo los últimos 16KB
+                
+            buffer += chunk
+            
+            # Buscar el boundary que separa las imágenes
+            boundary_pos = buffer.find(BOUNDARY)
+            
+            while boundary_pos != -1:
+                # Encontrar el inicio del JPEG
+                jpeg_start = buffer.find(b'\xff\xd8', boundary_pos)
+                if jpeg_start == -1:
+                    break
+                    
+                # Encontrar el final del JPEG
+                jpeg_end = buffer.find(b'\xff\xd9', jpeg_start)
+                if jpeg_end == -1:
+                    break
+                
+                # Extraer y decodificar el frame JPEG
+                jpg_data = buffer[jpeg_start:jpeg_end + 2]
+                buffer = buffer[jpeg_end + 2:]
+                
+                # Convertir a imagen
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    # Mostrar frame original
+                    display_frame = frame.copy()
+                    
+                    # Contador de frames para procesar solo algunos
+                    if hasattr(stream_camera, 'frame_count'):
+                        stream_camera.frame_count += 1
+                    else:
+                        stream_camera.frame_count = 0
+                    
+                    # Procesar solo 1 de cada N frames
+                    if stream_camera.frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                        # Redimensionar directamente al tamaño objetivo para procesamiento
+                        frame_resized = cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+                    else:
+                        # Usar últimas detecciones conocidas
+                        frame_resized = None
+
+                    if frame_resized is not None:
+                        # Detectar personas con YOLO
+                        results = model(frame_resized)
+                        
+                        # Filtrar solo detecciones de personas con alta confianza
+                        detections = results[0].boxes.data
+                        personas_detectadas = []
+                        
+                        # Calcular factor de escala para redimensionar las detecciones al tamaño original
+                        scale_x = frame.shape[1] / TARGET_SIZE[0]
+                        scale_y = frame.shape[0] / TARGET_SIZE[1]
+                        
+                        for det in detections:
+                            if int(det[5]) == 0 and float(det[4]) >= CONFIDENCE_THRESHOLD:  # Clase 0 es 'person' en COCO
+                                x1, y1, x2, y2, conf = det[:5]
+                                # Convertir coordenadas al formato (x, y, w, h) y escalar al tamaño original
+                                x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
+                                x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
+                                w, h = x2 - x1, y2 - y1
+                                # Solo considerar detecciones con tamaño razonable
+                                if w * h >= 1000:  # Filtrar detecciones muy pequeñas
+                                    personas_detectadas.append(((x1, y1, w, h), conf))
+                    
+                    # Actualizar el tracker y obtener el conteo estable
+                    num_personas = tracker.update(personas_detectadas)
+                    
+                    # Dibujar los rectángulos solo para las detecciones estables
+                    for (x, y, w, h), conf in personas_detectadas:
+                        # Dibujar rectángulo más visible
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        
+                        # Mostrar porcentaje de confianza sobre cada rectángulo
+                        confianza = f"{conf*100:.0f}%"
+                        cv2.putText(frame, confianza, (x, y-10), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
+                    # Mostrar el contador de personas con texto más grande
+                    texto = f"Personas detectadas: {num_personas}"
+                    
+                    # Fondo negro para mejor visibilidad del texto
+                    font_scale = 0.5  # Tamaño de fuente más grande
+                    thickness = 2
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    
+                    # Obtener el tamaño del texto para el fondo
+                    (text_width, text_height), baseline = cv2.getTextSize(texto, font, font_scale, thickness)
+                    
+                    # Dibujar fondo negro semi-transparente
+                    overlay = frame.copy()
+                    cv2.rectangle(overlay, (10, 10), (text_width + 20, text_height + 25), (0, 0, 0), -1)
+                    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+                    
+                    # Dibujar texto
+                    cv2.putText(frame, texto, (15, text_height + 15), font, 
+                              font_scale, (0, 255, 0), thickness)
+                    
+                    # Mostrar el frame
+                    cv2.imshow('ESP32-CAM Stream', frame)
+                    
+                    # Salir con ESC o si la ventana se cierra
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27 or cv2.getWindowProperty('ESP32-CAM Stream', cv2.WND_PROP_VISIBLE) < 1:
+                        return
+                        
+                # Buscar el siguiente boundary
+                boundary_pos = buffer.find(BOUNDARY)
+            
+            # Limpiar el buffer después de procesar cada frame
+            if boundary_pos != -1 and len(buffer) > 16384:  # 16KB
+                buffer = b''  # Reiniciar el buffer
+                
+    except RequestException as e:
+        print(f"Error de conexión: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        cv2.destroyAllWindows()
+    
+
+
+if __name__ == "__main__":
+    stream_camera()

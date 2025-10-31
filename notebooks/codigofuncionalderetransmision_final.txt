@@ -1,0 +1,88 @@
+# camera_stream.py
+import cv2
+import numpy as np
+import requests
+from requests.exceptions import RequestException
+
+# URL de la ESP32-CAM
+ESP32_URL = "http://172.20.10.2/stream"
+
+# Boundary del stream MJPEG
+BOUNDARY = b'--1234567890000000000009876543'
+
+def stream_camera():
+    try:
+        print(f"Conectando a {ESP32_URL}...")
+        
+        # Configurar headers
+        headers = {
+            'Accept': 'multipart/x-mixed-replace;boundary=1234567890000000000009876543'
+        }
+        
+        # Iniciar el stream
+        response = requests.get(ESP32_URL, stream=True, headers=headers)
+        
+        if response.status_code != 200:
+            raise RequestException(f"Error de conexión: código {response.status_code}")
+            
+        print("[OK] Conexión establecida")
+        
+        # Buffer para los datos
+        buffer = b''
+        
+        # Crear ventana para mostrar el video
+        cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+        
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+                
+            buffer += chunk
+            
+            # Buscar el boundary que separa las imágenes
+            boundary_pos = buffer.find(BOUNDARY)
+            
+            while boundary_pos != -1:
+                # Encontrar el inicio del JPEG
+                jpeg_start = buffer.find(b'\xff\xd8', boundary_pos)
+                if jpeg_start == -1:
+                    break
+                    
+                # Encontrar el final del JPEG
+                jpeg_end = buffer.find(b'\xff\xd9', jpeg_start)
+                if jpeg_end == -1:
+                    break
+                
+                # Extraer y decodificar el frame JPEG
+                jpg_data = buffer[jpeg_start:jpeg_end + 2]
+                buffer = buffer[jpeg_end + 2:]
+                
+                # Convertir a imagen
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    # Mostrar el frame
+                    cv2.imshow('ESP32-CAM Stream', frame)
+                    
+                    # Salir con ESC o si la ventana se cierra
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == 27 or cv2.getWindowProperty('ESP32-CAM Stream', cv2.WND_PROP_VISIBLE) < 1:
+                        return
+                        
+                # Buscar el siguiente boundary
+                boundary_pos = buffer.find(BOUNDARY)
+            
+            # Evitar que el buffer crezca demasiado
+            if len(buffer) > 100000:
+                buffer = buffer[-50000:]
+                
+    except RequestException as e:
+        print(f"Error de conexión: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        cv2.destroyAllWindows()
+    
+
+
+if __name__ == "__main__":
+    stream_camera()

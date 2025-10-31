@@ -1,0 +1,574 @@
+
+# camera_stream.py
+import os
+import sys
+
+# Configurar variables de entorno ANTES de importar torch/ultralytics
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # Evitar error OpenMP en Windows
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"     # GPU asíncrona para máxima velocidad
+
+# IMPORTANTE: Para usar GPU NVIDIA (no Intel iGPU):
+# - Tu sistema: GPU 0 (Task Manager) = Intel Iris Xe (no CUDA)
+#               GPU 1 (Task Manager) = NVIDIA MX450 (sí CUDA)
+# - PyTorch solo ve GPUs NVIDIA, por lo que tu MX450 es el índice CUDA 0
+# - Dejar comentado para usar automáticamente la MX450:
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+import cv2
+import numpy as np
+import requests
+from requests.exceptions import RequestException
+import torch
+from ultralytics import YOLO
+import time
+from datetime import datetime
+
+# Configuración de detección (ajustada para mayor sensibilidad)
+CONFIDENCE_THRESHOLD = 0.25  # Umbral base de confianza para detecciones (antes 0.35)
+MIN_BOX_AREA = 300          # Área mínima de caja para filtrar ruido (antes 800)
+MAX_BOX_AREA = 500000       # Área máxima aceptada (antes 200000)
+MAX_NO_DETECT_FRAMES = 10   # Frames consecutivos sin detectar para bajar conf adaptativamente
+MAX_FRAMES_HISTORY = 5      # Número de frames para promediar
+PROCESS_EVERY_N_FRAMES = 2  # Procesar 1 de cada N frames (antes 3)
+TARGET_SIZE = (384, 288)    # Tamaño mayor para más detalle (antes 256x192)
+FACE_FALLBACK_ENABLED = True  # Activar fallback de detección de rostro si no hay persona
+FACE_FALLBACK_COOLDOWN = 5    # Intentar fallback cada N frames cuando corresponda
+
+# Verificar disponibilidad de CUDA
+print("PyTorch versión:", torch.__version__)
+print("CUDA disponible:", torch.cuda.is_available())
+print("Número de GPUs:", torch.cuda.device_count())
+print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
+if torch.cuda.is_available():
+    for i in range(torch.cuda.device_count()):
+        try:
+            print(f"GPU[{i}]: {torch.cuda.get_device_name(i)}")
+        except Exception:
+            pass
+
+if torch.cuda.is_available():
+    print(f"Usando GPU: {torch.cuda.get_device_name(0)}")
+    print("CUDA versión:", torch.version.cuda)
+    device = "cuda"
+    # Optimización de cuDNN para tamaños fijos
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+else:
+    print("GPU no disponible, usando CPU")
+    print("Razones posibles:")
+    print("1. No hay GPU NVIDIA instalada")
+    print("2. Drivers NVIDIA no instalados o desactualizados")
+    print("3. CUDA Toolkit no instalado o incompatible")
+    device = "cpu"
+
+# URL de la ESP32-CAM y configuración del stream
+ESP32_URL = "http://172.20.10.2/stream"
+BOUNDARY = b'--1234567890000000000009876543'
+
+# Cargar y configurar modelo YOLO
+model = YOLO('yolov8n.pt')  # Modelo pequeño y rápido
+model.to(device)
+if torch.cuda.is_available():
+    model.fuse()  # Fusionar capas para mejor rendimiento en GPU
+
+# Intentar usar FP16 en CUDA
+USE_FP16 = False
+try:
+    if device == "cuda" and hasattr(model, 'model'):
+        model.model.half()
+        USE_FP16 = True
+except Exception:
+    USE_FP16 = False
+
+# Reportar dispositivo y dtype reales del modelo
+try:
+    param = next(model.model.parameters()) if hasattr(model, 'model') else None
+    if param is not None:
+        print("Modelo en dispositivo:", param.device, "dtype:", param.dtype)
+except Exception:
+    pass
+
+# Cargador de detección de rostro (fallback)
+FACE_CASCADE = None
+try:
+    cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    if os.path.exists(cascade_path):
+        FACE_CASCADE = cv2.CascadeClassifier(cascade_path)
+except Exception:
+    FACE_CASCADE = None
+
+
+# --- Simple Centroid Tracker for Unique Person Counting ---
+import math
+class DetectionTracker:
+    def __init__(self, max_history=MAX_FRAMES_HISTORY, max_lost=15, dist_thresh=120):
+        # dist_thresh: distancia máxima (en píxeles) para considerar que una detección es la misma persona entre frames.
+        self.max_history = max_history
+        self.detection_history = []
+        self.last_count = 0
+        self.frame_latency_history = []
+        self.rtt_history = []
+        self.last_frame_time = time.time()
+        self.last_request_time = time.time()
+        self.start_time = time.time()
+        self.frame_count = 0
+        self.last_fps_update = time.time()
+        self.current_fps = 0
+        # Tracker state
+        self.next_id = 1
+        self.tracks = {}  # id: {'centroid': (x, y), 'lost': 0}
+        self.max_lost = max_lost
+        self.dist_thresh = dist_thresh
+        self.unique_ids = set()
+    
+    def _centroid(self, box):
+        x, y, w, h = box
+        return (x + w // 2, y + h // 2)
+    
+    def update(self, current_detections, is_new_frame=True):
+        current_time = time.time()
+        if is_new_frame:
+            self.frame_count += 1
+            time_elapsed = current_time - self.last_fps_update
+            if time_elapsed >= 1.0:
+                self.current_fps = self.frame_count / time_elapsed
+                self.frame_count = 0
+                self.last_fps_update = current_time
+            frame_latency = current_time - self.last_frame_time
+            if frame_latency > 0:
+                self.frame_latency_history.append(frame_latency * 1000)
+                if len(self.frame_latency_history) > 30:
+                    self.frame_latency_history.pop(0)
+            self.last_frame_time = current_time
+        rtt = current_time - self.last_request_time
+        self.last_request_time = current_time
+        if rtt > 0:
+            self.rtt_history.append(rtt * 1000)
+            if len(self.rtt_history) > 30:
+                self.rtt_history.pop(0)
+
+        # --- Centroid tracking logic ---
+        detections = [d[0] for d in current_detections]  # [(x, y, w, h), ...]
+        det_centroids = [self._centroid(box) for box in detections]
+        assigned = set()
+        updated_tracks = {}
+        # Match detections to existing tracks
+        for tid, tinfo in self.tracks.items():
+            tcent = tinfo['centroid']
+            min_dist = float('inf')
+            min_idx = -1
+            for idx, cent in enumerate(det_centroids):
+                if idx in assigned:
+                    continue
+                dist = math.hypot(cent[0] - tcent[0], cent[1] - tcent[1])
+                if dist < min_dist:
+                    min_dist = dist
+                    min_idx = idx
+            if min_idx != -1 and min_dist < self.dist_thresh:
+                # Update track
+                updated_tracks[tid] = {'centroid': det_centroids[min_idx], 'lost': 0}
+                assigned.add(min_idx)
+            else:
+                # Mark as lost
+                if tinfo['lost'] + 1 < self.max_lost:
+                    updated_tracks[tid] = {'centroid': tcent, 'lost': tinfo['lost'] + 1}
+        # Add new tracks for unassigned detections
+        for idx, cent in enumerate(det_centroids):
+            if idx not in assigned:
+                updated_tracks[self.next_id] = {'centroid': cent, 'lost': 0}
+                self.unique_ids.add(self.next_id)
+                self.next_id += 1
+        # Remove tracks lost for too long
+        self.tracks = {tid: tinfo for tid, tinfo in updated_tracks.items() if tinfo['lost'] < self.max_lost}
+        # Count current unique persons (active tracks)
+        current_ids = list(self.tracks.keys())
+        self.last_count = len(current_ids)
+        # History for smoothing (not used for unique count)
+        self.detection_history.append(current_detections)
+        if len(self.detection_history) > self.max_history:
+            self.detection_history.pop(0)
+        avg_fps = round(self.current_fps, 1)
+        avg_frame_latency = round(sum(self.frame_latency_history) / len(self.frame_latency_history), 1) if self.frame_latency_history else 0
+        avg_rtt = round(sum(self.rtt_history) / len(self.rtt_history), 1) if self.rtt_history else 0
+        stats = {
+            'fps': avg_fps,
+            'frame_latency': avg_frame_latency,
+            'rtt': avg_rtt,
+            'tiempo_total': round(current_time - self.start_time, 1),
+            'detecciones_totales': len(self.unique_ids),
+            'personas_actuales': self.last_count
+        }
+        return self.last_count, stats
+
+# Crear instancia del tracker
+tracker = DetectionTracker()
+
+def mostrar_pantalla_inicio():
+    # Crear una ventana de inicio con espacio para panel lateral
+    window_name = 'ESP32-CAM Stream'
+    window_width = 1024  # Ancho total de la ventana
+    window_height = 600  # Alto total de la ventana
+    img = np.zeros((window_height, window_width, 3), dtype=np.uint8)
+    
+    # Configuración de texto
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    color_texto = (0, 255, 0)
+    
+    # Título
+    cv2.putText(img, "Sistema de Detección de Personas", 
+                (100, 180), font, 1.2, color_texto, 2)
+    cv2.putText(img, "PUCP - Proyecto de Diseño Mecatrónico", 
+                (120, 230), font, 0.8, color_texto, 2)
+    
+    # Estado
+    cv2.putText(img, "Iniciando sistema...", 
+                (220, 300), font, 0.7, (0, 255, 255), 1)
+    
+    # Información del sistema
+    info_y = 350
+    cv2.putText(img, f"PyTorch: {torch.__version__}", 
+                (50, info_y), font, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, f"CUDA: {torch.version.cuda if torch.cuda.is_available() else 'No disponible'}", 
+                (50, info_y + 30), font, 0.6, (200, 200, 200), 1)
+    cv2.putText(img, f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}", 
+                (50, info_y + 60), font, 0.6, (200, 200, 200), 1)
+    
+    cv2.imshow(window_name, img)
+    cv2.waitKey(2000)  # Mostrar por 2 segundos
+    return window_name
+
+def stream_camera():
+    try:
+        # Mostrar pantalla de inicio
+        window_name = mostrar_pantalla_inicio()
+        print(f"Conectando a {ESP32_URL}...")
+        
+        # Configurar headers
+        headers = {
+            'Accept': 'multipart/x-mixed-replace;boundary=1234567890000000000009876543'
+        }
+        
+        # Iniciar el stream
+        response = requests.get(ESP32_URL, stream=True, headers=headers, timeout=5)
+        
+        if response.status_code != 200:
+            raise RequestException(f"Error de conexión: código {response.status_code}")
+            
+        print("[OK] Conexión establecida")
+        
+        # Buffer para los datos
+        buffer = b''
+        
+        # Crear ventana para mostrar el video
+        cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+        
+        # Usar un chunk_size más pequeño para reducir latencia
+        for chunk in response.iter_content(chunk_size=1024):
+            if not chunk:
+                continue
+            
+            # Limitar el tamaño del buffer antes de agregar nuevo chunk
+            if len(buffer) > 32768:  # 32KB máximo
+                buffer = buffer[-16384:]  # Mantener solo los últimos 16KB
+                
+            buffer += chunk
+            
+            # Buscar el boundary que separa las imágenes
+            boundary_pos = buffer.find(BOUNDARY)
+            
+            while boundary_pos != -1:
+                # Encontrar el inicio del JPEG
+                jpeg_start = buffer.find(b'\xff\xd8', boundary_pos)
+                if jpeg_start == -1:
+                    break
+                    
+                # Encontrar el final del JPEG
+                jpeg_end = buffer.find(b'\xff\xd9', jpeg_start)
+                if jpeg_end == -1:
+                    break
+                
+                # Extraer y decodificar el frame JPEG
+                jpg_data = buffer[jpeg_start:jpeg_end + 2]
+                buffer = buffer[jpeg_end + 2:]
+                
+                # Convertir a imagen
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+                    
+                # Validar dimensiones del frame
+                frame_height, frame_width = frame.shape[:2]
+                if frame_height <= 0 or frame_width <= 0:
+                    continue
+                    
+                # Crear un canvas más grande para el frame y el panel lateral
+                canvas = np.zeros((600, 1024, 3), dtype=np.uint8)
+                
+                # Verificar que el frame cabe en el canvas
+                if frame_height > 500 or frame_width > 450:
+                    # Redimensionar frame si es muy grande
+                    scale = min(500/frame_height, 450/frame_width)
+                    new_width = int(frame_width * scale)
+                    new_height = int(frame_height * scale)
+                    frame = cv2.resize(frame, (new_width, new_height))
+                    frame_height, frame_width = frame.shape[:2]
+                
+                # Mostrar frame original en la parte izquierda
+                try:
+                    canvas[50:50+frame_height, 50:50+frame_width] = frame
+                except ValueError as e:
+                    print(f"Error al copiar frame al canvas: {e}")
+                    continue
+                    
+                # Inicializar atributos de stream_camera si no existen
+                if not hasattr(stream_camera, 'frame_count'):
+                    stream_camera.frame_count = 0
+                    stream_camera.no_detect_frames = 0
+                    stream_camera.conf_current = CONFIDENCE_THRESHOLD
+                    stream_camera.last_detecciones = []
+                
+                stream_camera.frame_count += 1
+                
+                panel_x = 50 + frame_width + 30  # 30px de separación
+                panel_width = max(100, canvas.shape[1] - panel_x - 50)  # Mínimo 100px
+                
+                # Procesar solo 1 de cada N frames
+                personas_detectadas = stream_camera.last_detecciones
+                if stream_camera.frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                    # Redimensionar directamente al tamaño objetivo para procesamiento
+                    frame_resized = cv2.resize(frame, TARGET_SIZE, interpolation=cv2.INTER_AREA)
+                else:
+                    # Usar últimas detecciones conocidas
+                    frame_resized = None
+
+                # Ajuste adaptativo del umbral si pasaron muchos frames sin detecciones
+                if stream_camera.no_detect_frames >= MAX_NO_DETECT_FRAMES:
+                    threshold_current = max(0.15, CONFIDENCE_THRESHOLD - 0.10)
+                else:
+                    threshold_current = CONFIDENCE_THRESHOLD
+                stream_camera.conf_current = threshold_current
+
+                if frame_resized is not None:
+                    # Detectar personas con YOLO
+                    try:
+                        results = model(frame_resized, verbose=False, half=USE_FP16)
+                    except TypeError:
+                        # Si la versión no soporta 'half' como argumento
+                        results = model(frame_resized, verbose=False)
+                    except Exception as e:
+                        print(f"Error en inferencia YOLO: {e}")
+                        results = None
+                    
+                    if results is not None:
+                        # Filtrar solo detecciones de personas con alta confianza
+                        detections = results[0].boxes.data
+                        nuevas_detecciones = []
+                        
+                        # Calcular factor de escala para redimensionar las detecciones al tamaño original
+                        scale_x = frame.shape[1] / TARGET_SIZE[0]
+                        scale_y = frame.shape[0] / TARGET_SIZE[1]
+                        
+                        for det in detections:
+                            try:
+                                # Clase 0 es 'person' en COCO
+                                if int(det[5]) == 0 and float(det[4]) >= threshold_current:
+                                    x1, y1, x2, y2, conf = det[:5]
+                                    # Convertir coordenadas al formato (x, y, w, h) y escalar al tamaño original
+                                    x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
+                                    x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
+                                    w, h = x2 - x1, y2 - y1
+                                    # Solo considerar detecciones con tamaño razonable
+                                    area = w * h
+                                    if area >= MIN_BOX_AREA and area <= MAX_BOX_AREA and w > 0 and h > 0:
+                                        nuevas_detecciones.append(((x1, y1, w, h), conf))
+                            except Exception as e:
+                                print(f"Error procesando detección: {e}")
+                                continue
+                        
+                        # Actualizar detecciones y persistir últimas válidas
+                        personas_detectadas = nuevas_detecciones
+                        stream_camera.last_detecciones = personas_detectadas
+
+                # Si no hubo detecciones de persona, intentar fallback de rostro
+                if (FACE_FALLBACK_ENABLED and FACE_CASCADE is not None and 
+                    len(personas_detectadas) == 0 and 
+                    stream_camera.no_detect_frames >= MAX_NO_DETECT_FRAMES and 
+                    stream_camera.frame_count % FACE_FALLBACK_COOLDOWN == 0):
+                    try:
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                        if len(faces) > 0:
+                            personas_detectadas = []
+                            for (fx, fy, fw, fh) in faces:
+                                # tratar rostro como 1 detección (sin confianza)
+                                personas_detectadas.append(((int(fx), int(fy), int(fw), int(fh)), None))
+                            stream_camera.last_detecciones = personas_detectadas
+                    except Exception as e:
+                        print(f"Error en detección de rostro: {e}")
+
+                # Actualizar contador de frames sin detecciones
+                if len(personas_detectadas) == 0:
+                    stream_camera.no_detect_frames += 1
+                else:
+                    stream_camera.no_detect_frames = 0
+                
+                # Dibujar las detecciones con estilo moderno
+                for (x, y, w, h), conf in personas_detectadas:
+                    try:
+                        # Ajustar coordenadas para el offset del canvas
+                        x_canvas = x + 50  # 50 es el margen izquierdo
+                        y_canvas = y + 50  # 50 es el margen superior
+                        
+                        # Validar que las coordenadas están dentro del canvas
+                        if x_canvas < 0 or y_canvas < 0 or x_canvas + w >= canvas.shape[1] or y_canvas + h >= canvas.shape[0]:
+                            continue
+                        
+                        # Color base para las detecciones
+                        color_box = (0, 255, 0)
+                        
+                        # Dibujar rectángulo principal
+                        cv2.rectangle(canvas, (x_canvas, y_canvas), 
+                                   (x_canvas + w, y_canvas + h), color_box, 2)
+                        
+                        # Barra superior con etiqueta y confianza
+                        label_bg_color = (40, 40, 40)
+                        label_height = 25
+                        confianza = f"Persona {conf*100:.0f}%" if conf is not None else "Cara"
+                        
+                        # Fondo de la etiqueta
+                        if y_canvas - label_height >= 0:
+                            cv2.rectangle(canvas, (x_canvas, y_canvas - label_height), 
+                                       (x_canvas + w, y_canvas), label_bg_color, -1)
+                            
+                            # Texto de la etiqueta
+                            cv2.putText(canvas, confianza, (x_canvas + 5, y_canvas - 7),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        
+                        # Indicador de esquina superior izquierda
+                        corner_size = min(20, w//4, h//4)
+                        cv2.line(canvas, (x_canvas, y_canvas), 
+                               (x_canvas + corner_size, y_canvas), color_box, 2)
+                        cv2.line(canvas, (x_canvas, y_canvas), 
+                               (x_canvas, y_canvas + corner_size), color_box, 2)
+                        
+                        # Indicador de esquina inferior derecha
+                        cv2.line(canvas, (x_canvas + w - corner_size, y_canvas + h), 
+                               (x_canvas + w, y_canvas + h), color_box, 2)
+                        cv2.line(canvas, (x_canvas + w, y_canvas + h - corner_size), 
+                               (x_canvas + w, y_canvas + h), color_box, 2)
+                    except Exception as e:
+                        print(f"Error dibujando detección: {e}")
+                        continue
+                
+                # Obtener estadísticas
+                num_personas, stats = tracker.update(personas_detectadas)
+                
+                # Configuración de la interfaz
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                color_titulo = (0, 220, 0)  # Verde claro
+                color_texto = (200, 200, 200)  # Gris claro
+                
+                # Título en la parte superior
+                cv2.putText(canvas, "Sistema de Detección de Personas - PUCP", 
+                          (50, 30), font, 0.8, color_titulo, 2)
+                
+                # Panel de métricas de rendimiento
+                y_pos = 80
+                
+                # Dibujar fondo para métricas
+                try:
+                    metrics_bg = np.zeros((160, panel_width, 3), dtype=np.uint8)
+                    metrics_bg[:, :] = (30, 30, 30)  # Fondo gris oscuro
+                    canvas[y_pos:y_pos+160, panel_x:panel_x+panel_width] = metrics_bg
+                except ValueError:
+                    pass  # Si panel_width es inválido, continuar sin fondo
+                
+                # Panel de métricas reordenado y renombrado
+                y_panel = y_pos + 30
+                cv2.putText(canvas, "Personas detectadas:", 
+                          (panel_x + 10, y_panel), font, 0.7, color_texto, 1)
+                cv2.putText(canvas, str(num_personas), 
+                          (panel_x + panel_width - 60, y_panel), font, 0.9, color_titulo, 2)
+                y_panel += 35
+                
+                # FPS
+                fps = stats['fps']
+                fps_text = f"{fps:.1f} FPS"
+                fps_color = (0, 255, 0) if fps >= 30 else (0, 255, 255) if fps >= 20 else (0, 0, 255)
+                cv2.putText(canvas, fps_text, (panel_x + 10, y_panel), font, 0.7, fps_color, 2)
+                y_panel += 30
+                
+                # Latencia
+                frame_latency = stats['frame_latency']
+                latency_text = f"Latencia: {frame_latency:.1f} ms"
+                latency_color = (0, 255, 0) if frame_latency <= 30 else (0, 255, 255) if frame_latency <= 50 else (0, 0, 255)
+                cv2.putText(canvas, latency_text, (panel_x + 10, y_panel), font, 0.7, latency_color, 2)
+                y_panel += 30
+                
+                # RTT
+                rtt = stats['rtt']
+                rtt_text = f"RTT: {rtt:.1f} ms"
+                rtt_color = (0, 255, 0) if rtt <= 50 else (0, 255, 255) if rtt <= 100 else (0, 0, 255)
+                cv2.putText(canvas, rtt_text, (panel_x + 10, y_panel), font, 0.7, rtt_color, 2)
+                y_panel += 30
+                
+                # Confianza actual
+                cv2.putText(canvas, f"Confianza actual: {stream_camera.conf_current:.2f}", 
+                          (panel_x + 10, y_panel), font, 0.7, color_texto, 1)
+                y_panel += 30
+                
+                # Tiempo de ejecución
+                cv2.putText(canvas, f"Tiempo de ejecución: {stats['tiempo_total']}s", 
+                          (panel_x + 10, y_panel), font, 0.7, color_texto, 1)
+                y_panel += 30
+                
+                # Detecciones totales
+                cv2.putText(canvas, f"Detecciones totales: {stats['detecciones_totales']}", 
+                          (panel_x + 10, y_panel), font, 0.7, color_texto, 1)
+                y_panel += 35
+                
+                # Fecha y hora actual
+                tiempo_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(canvas, tiempo_actual, (panel_x + 10, y_panel), font, 0.7, color_texto, 1)
+                
+                # Borde del video
+                cv2.rectangle(canvas, (48, 48), (52+frame_width, 52+frame_height), color_titulo, 2)
+                
+                # Mostrar el canvas completo
+                cv2.imshow('ESP32-CAM Stream', canvas)
+                
+                # Salir con ESC o si la ventana se cierra
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or cv2.getWindowProperty('ESP32-CAM Stream', cv2.WND_PROP_VISIBLE) < 1:
+                    return
+                        
+                # Buscar el siguiente boundary
+                boundary_pos = buffer.find(BOUNDARY)
+            
+            # Limpiar el buffer después de procesar cada frame
+            if boundary_pos != -1 and len(buffer) > 16384:  # 16KB
+                buffer = b''  # Reiniciar el buffer
+                
+    except RequestException as e:
+        print(f"\n[ERROR] Conexión perdida: {e}")
+        print("Verifica:")
+        print("  - ESP32-CAM está encendida")
+        print(f"  - URL correcta: {ESP32_URL}")
+        print("  - Red WiFi conectada")
+    except KeyboardInterrupt:
+        print("\n[INFO] Programa interrumpido por el usuario")
+    except Exception as e:
+        print(f"\n[ERROR] Error inesperado: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("[INFO] Cerrando ventanas...")
+        cv2.destroyAllWindows()
+        print("[INFO] Programa terminado")
+    
+
+
+if __name__ == "__main__":
+    stream_camera()

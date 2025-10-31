@@ -1,0 +1,189 @@
+# camera_stream.py
+import cv2
+import numpy as np
+import requests
+from requests.exceptions import RequestException
+
+# URL de la ESP32-CAM
+ESP32_URL = "http://172.20.10.2/stream"
+
+# Boundary del stream MJPEG
+BOUNDARY = b'--1234567890000000000009876543'
+
+def stream_camera():
+    try:
+        print(f"Conectando a {ESP32_URL}...")
+        
+        # Configurar headers
+        headers = {
+            'Accept': 'multipart/x-mixed-replace;boundary=1234567890000000000009876543'
+        }
+        
+        # Iniciar el stream
+        response = requests.get(ESP32_URL, stream=True, headers=headers)
+        
+        if response.status_code != 200:
+            raise RequestException(f"Error de conexión: código {response.status_code}")
+            
+        print("[OK] Conexión establecida")
+        
+        # Buffer para los datos
+        buffer = b''
+        
+        # Crear ventana para mostrar el video
+        cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+        
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+                
+            buffer += chunk
+            
+            # Buscar el boundary que separa las imágenes
+            boundary_pos = buffer.find(BOUNDARY)
+            
+            while boundary_pos != -1:
+                # Encontrar el inicio del JPEG
+                jpeg_start = buffer.find(b'\xff\xd8', boundary_pos)
+                if jpeg_start == -1:
+                    break
+                    
+                # Encontrar el final del JPEG
+                jpeg_end = buffer.find(b'\xff\xd9', jpeg_start)
+                if jpeg_end == -1:
+                    break
+                
+                # Extraer y decodificar el frame JPEG
+                jpg_data = buffer[jpeg_start:jpeg_end + 2]
+                buffer = buffer[jpeg_end + 2:]
+                
+                # Convertir a imagen
+                frame = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is not None:
+                    # Mostrar el frame
+                    cv2.imshow('ESP32-CAM Stream', frame)
+                    
+                    # Salir con ESC
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        return
+                        
+                # Buscar el siguiente boundary
+                boundary_pos = buffer.find(BOUNDARY)
+            
+            # Evitar que el buffer crezca demasiado
+            if len(buffer) > 100000:
+                buffer = buffer[-50000:]
+                
+    except RequestException as e:
+        print(f"Error de conexión: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        cv2.destroyAllWindows()
+    
+    # Intentar cada URL disponible
+    for url in ESP32_URLS:
+        try:
+            print(f"Intentando conectar a {url}...")
+            headers = {
+                'Accept': 'multipart/x-mixed-replace; boundary=frame',
+                'Connection': 'keep-alive'
+            }
+            stream = session.get(url, stream=True, timeout=30, headers=headers)
+            
+            if stream.status_code != 200:
+                print(f"Error: código de estado {stream.status_code}")
+                continue
+                
+            print(f"[OK] Conexión establecida con {url}")
+            
+            # Buffer para almacenar los bytes del stream
+            bytes_buf = b""
+            
+            # Crear ventana para mostrar el video
+            cv2.namedWindow('ESP32-CAM Stream', cv2.WINDOW_NORMAL)
+            
+            last_frame_time = time.time()
+            retry_count = 0
+            
+            while True:
+                try:
+                    # Leer chunks del stream con timeout
+                    for chunk in stream.iter_content(chunk_size=4096):
+                        if not chunk:
+                            print("Chunk vacío recibido")
+                            continue
+                            
+                        bytes_buf += chunk
+                        
+                        # Buscar múltiples frames en el buffer
+                        while True:
+                            a = bytes_buf.find(b'\xff\xd8')  # JPEG Start Of Image
+                            b = bytes_buf.find(b'\xff\xd9')  # JPEG End Of Image
+                            
+                            if a != -1 and b != -1 and b > a:
+                                # Extraer el frame JPEG
+                                jpg = bytes_buf[a:b+2]
+                                bytes_buf = bytes_buf[b+2:]
+                                
+                                # Decodificar y mostrar el frame
+                                frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                                if frame is not None:
+                                    cv2.imshow('ESP32-CAM Stream', frame)
+                                    last_frame_time = time.time()
+                                    retry_count = 0
+                                else:
+                                    print("Error al decodificar el frame")
+                            else:
+                                # No hay más frames completos en el buffer
+                                break
+                            
+                            # Presionar 'ESC' para salir
+                            key = cv2.waitKey(1)
+                            if key == 27:  # ESC
+                                cv2.destroyAllWindows()
+                                return
+                            
+                        # Limpiar el buffer si es muy grande
+                        if len(bytes_buf) > 65536:
+                            print("Limpiando buffer...")
+                            bytes_buf = b""
+                        
+                        # Verificar si no hemos recibido frames por más de 5 segundos
+                        current_time = time.time()
+                        if current_time - last_frame_time > 5:
+                            retry_count += 1
+                            print(f"Sin frames nuevos por {current_time - last_frame_time:.1f} segundos")
+                            if retry_count > 3:
+                                print("No se han recibido frames por más de 5 segundos")
+                                raise TimeoutError("Tiempo de espera agotado")
+                            print("Reconectando...")
+                            break
+                
+                except TimeoutError as te:
+                    print(f"Error de timeout: {te}")
+                    break
+                except Exception as e:
+                    print(f"Error durante la transmisión: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+                    
+        except requests.RequestException as e:
+            last_error = e
+            print(f"Error de conexión con {url}: {str(e)}")
+            continue
+        except Exception as e:
+            print(f"Error inesperado: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            break
+            
+    if last_error:
+        print("No se pudo establecer conexión con ninguna URL")
+    
+    cv2.destroyAllWindows()
+    print("Stream cerrado")
+
+if __name__ == "__main__":
+    stream_camera()
