@@ -1,5 +1,5 @@
 # Drone Telemetry Video Detection
-Amén
+David estubo aquí.
 # 🚁 Sistema Integrado de Detección de Personas y Telemetría de Drones
 
 Sistema completo de monitoreo en tiempo real que combina **detección de personas** mediante ESP32-CAM con **telemetría de drones** vía radio MAVLink. Desarrollado como proyecto del curso ** Proyecto de Diseño Mecatrónico** en la Pontificia Universidad Católica del Perú - PUCP.
