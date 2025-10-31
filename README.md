@@ -56,3 +56,33 @@ Sistema completo de monitoreo en tiempo real que combina **detección de persona
 ### ¿Cómo funciona?
 
 El sistema lee los datos de telemetría del dron directamente desde el **receptor Holybro** conectado por USB a la laptop, decodifica los mensajes **MAVLink** y los visualiza en la misma interfaz donde se muestra el video del ESP32-CAM.
+
+↓
+→ Dron (con radio TX) → Radio RX Holybro → USB → Python (PyMAVLink) → Interfaz
+→ ESP32-CAM → WiFi → Python (OpenCV + YOLO) ─────────→ Interfaz
+
+
+### Datos de Telemetría Disponibles
+
+- **Posición GPS**: Latitud, Longitud, Altitud
+- **Actitud**: Roll, Pitch, Yaw
+- **Velocidad**: Ground speed, Airspeed
+- **Batería**: Voltaje, Corriente, Porcentaje
+- **Estado del sistema**: Modo de vuelo, Armado/Desarmado
+- **Sensores**: Presión barométrica, Temperatura
+- **Distancia Home**: Distancia y dirección al punto de despegue
+
+## 📋 Requisitos del Sistema
+
+### Hardware
+- **ESP32-CAM** con módulo WiFi configurado
+- **Radio de telemetría Holybro** 915MHz 100mW (o compatible)
+- **Dron con autopiloto** compatible con MAVLink (ArduPilot, PX4)
+- (Opcional) **GPU NVIDIA** con soporte CUDA
+- **PC con Windows/Linux/Mac**
+
+### Software
+- Python 3.8 o superior
+- CUDA Toolkit (opcional, para GPU)
+- Drivers NVIDIA actualizados (si usas GPU)
+- Mission Planner (opcional, para configuración inicial del dron)
